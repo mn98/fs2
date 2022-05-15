@@ -24,8 +24,7 @@ package fs2
 package timeseries
 
 import scala.concurrent.duration._
-
-import cats.{Functor, Monoid}
+import cats.{Applicative, Functor, Monoid}
 import cats.data.Chain
 import cats.syntax.all._
 import cats.effect.kernel.{Clock, Temporal}
@@ -173,42 +172,43 @@ object TimeStamped {
     * This is particularly useful when timestamped data can be read in bulk (e.g., from a capture file)
     * but should be "played back" at real time speeds.
     */
-  def throttle[F[_]: Temporal, A](
-      throttlingFactor: Double,
-      tickResolution: FiniteDuration
-  ): Pipe[F, TimeStamped[A], TimeStamped[A]] = {
+  def throttling[F[_] : Temporal, A](
+                                         throttlingFactor: F[Option[Double]],
+                                         tickResolution: FiniteDuration
+                                       ): Pipe[F, TimeStamped[A], TimeStamped[A]] = {
 
     val ticksPerSecond = 1.second.toMillis / tickResolution.toMillis
 
     require(ticksPerSecond > 0L, "tickResolution must be <= 1 second")
 
-    def doThrottle: Pipe2[F, TimeStamped[A], Unit, TimeStamped[A]] = {
+    def go: Pipe2[F, TimeStamped[A], Unit, TimeStamped[A]] = {
 
       type PullFromSourceOrTicks =
         (
-            Stream.StepLeg[F, TimeStamped[A]],
+          Stream.StepLeg[F, TimeStamped[A]],
             Stream.StepLeg[F, Unit]
-        ) => Pull[F, TimeStamped[A], Unit]
+          ) => Pull[F, TimeStamped[A], Unit]
 
       def takeUpto(
-          chunk: Chunk[TimeStamped[A]],
-          upto: FiniteDuration
-      ): (Chunk[TimeStamped[A]], Chunk[TimeStamped[A]]) = {
+                    chunk: Chunk[TimeStamped[A]],
+                    upto: FiniteDuration
+                  ): (Chunk[TimeStamped[A]], Chunk[TimeStamped[A]]) = {
         val toTake = chunk.indexWhere(_.time > upto).getOrElse(chunk.size)
         chunk.splitAt(toTake)
       }
 
-      def read(upto: FiniteDuration): PullFromSourceOrTicks = { (src, ticks) =>
-        if (src.head.isEmpty) {
-          src.stepLeg.flatMap {
-            case Some(l) => read(upto)(l, ticks)
-            case None    => Pull.done
+      def read(upto: FiniteDuration): PullFromSourceOrTicks = {
+        (src, ticks) =>
+          if (src.head.isEmpty) {
+            src.stepLeg.flatMap {
+              case Some(l) => read(upto)(l, ticks)
+              case None => Pull.done
+            }
+          } else {
+            val (toOutput, pending) = takeUpto(src.head, upto)
+            if (pending.isEmpty) Pull.output(toOutput) >> read(upto)(src.setHead(Chunk.empty), ticks)
+            else Pull.output(toOutput) >> awaitTick(upto, pending)(src.setHead(Chunk.empty), ticks)
           }
-        } else {
-          val (toOutput, pending) = takeUpto(src.head, upto)
-          if (pending.isEmpty) Pull.output(toOutput) >> read(upto)(src.setHead(Chunk.empty), ticks)
-          else Pull.output(toOutput) >> awaitTick(upto, pending)(src.setHead(Chunk.empty), ticks)
-        }
       }
 
       def awaitTick(upto: FiniteDuration, pending: Chunk[TimeStamped[A]]): PullFromSourceOrTicks = {
@@ -216,15 +216,24 @@ object TimeStamped {
           if (ticks.head.isEmpty) {
             ticks.stepLeg.flatMap {
               case Some(leg) => awaitTick(upto, pending)(src, leg)
-              case None      => Pull.done
+              case None => Pull.done
             }
           } else {
-            val tl = ticks.setHead(ticks.head.drop(1))
-            val newUpto = upto + ((1000 / ticksPerSecond) * throttlingFactor).toLong.millis
-            val (toOutput, stillPending) = takeUpto(pending, newUpto)
-            Pull.output(toOutput) >> {
-              if (stillPending.isEmpty) read(newUpto)(src, tl)
-              else awaitTick(newUpto, stillPending)(src, tl)
+            Pull.eval(throttlingFactor).flatMap { throttlingFactor =>
+              val tl = ticks.setHead(ticks.head.drop(1))
+              throttlingFactor match {
+                case Some(throttlingFactor) =>
+                  val newUpto = upto + ((1000 / ticksPerSecond) * throttlingFactor).toLong.millis
+                  val (toOutput, stillPending) = takeUpto(pending, newUpto)
+                  if (stillPending.isEmpty) {
+                    Pull.output(toOutput) >> read(newUpto)(src, tl)
+                  } else {
+                    Pull.output(toOutput) >> awaitTick(newUpto, stillPending)(src, tl)
+                  }
+                case None =>
+                  // `pending` is always a non-empty Chunk
+                  Pull.output(pending) >> read(pending.last.get.time)(src, tl)
+              }
             }
           }
       }
@@ -244,8 +253,14 @@ object TimeStamped {
         }.stream
     }
 
-    source => (source.through2(Stream.awakeEvery[F](tickResolution).as(())))(doThrottle)
+    source => source.through2(Stream.awakeEvery[F](tickResolution).as(()))(go)
   }
+
+  def throttle[F[_]: Temporal, A](
+      throttlingFactor: Double,
+      tickResolution: FiniteDuration
+  )(implicit F: Applicative[F]): Pipe[F, TimeStamped[A], TimeStamped[A]] =
+    throttling[F, A](F.pure(Some(throttlingFactor)), tickResolution)
 
   /** Scan that filters the specified timestamped values to ensure
     * the output time stamps are always increasing in time. Other values are
